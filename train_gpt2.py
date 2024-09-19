@@ -4,6 +4,7 @@ import uuid
 import math
 import glob
 from dataclasses import dataclass
+import random
 
 import numpy as np
 import torch
@@ -103,11 +104,20 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
-        self.attn_scale = (1 / math.sqrt(2 * config.n_layer))
+        self.attn_scale = 1 / math.sqrt(2 * config.n_layer)
+        self.mask_1 = self._create_mask(config.mask_1, config.n_embd)
+        self.mask_2 = self._create_mask(config.mask_2, config.n_embd)
+
+    def _create_mask(self, mask_value, size):
+        if mask_value in (0.0, 1.0):
+            return torch.full((size,), mask_value)
+        mask = torch.zeros(size)
+        mask[:int(mask_value * size)] = 1
+        return mask[torch.randperm(size)]
 
     def forward(self, x):
-        x = x + self.attn_scale * self.attn(rmsnorm(x))
-        x = x + self.mlp(rmsnorm(x))
+        x = self.mask_1.to(x.device) * x + self.attn_scale * self.attn(rmsnorm(x))
+        x = self.mask_2.to(x.device) * x + self.mlp(rmsnorm(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -119,6 +129,8 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    mask_1: float = 1.0  # New parameter for the first mask
+    mask_2: float = 1.0  # New parameter for the second mask
 
 class GPT(nn.Module):
 
@@ -273,6 +285,8 @@ if __name__ == "__main__":
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--save_every", type=int, default=5000, help="every how many steps to save the checkpoint")
+    parser.add_argument("--mask_1", type=float, default=1.0, help="Mask value for the first residual connection")
+    parser.add_argument("--mask_2", type=float, default=1.0, help="Mask value for the second residual connection")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -306,10 +320,10 @@ if __name__ == "__main__":
     # init the model from scratch
     num_vocab = 50257
     model_config = {
-        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768),
-        "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024),
-        "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280),
-        "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600),
+        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768, mask_1=args.mask_1, mask_2=args.mask_2),
+        "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024, mask_1=args.mask_1, mask_2=args.mask_2),
+        "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280, mask_1=args.mask_1, mask_2=args.mask_2),
+        "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600, mask_1=args.mask_1, mask_2=args.mask_2),
     }[args.model]
     model = GPT(model_config)
     model = model.train().cuda()
