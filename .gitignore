@@ -1,8 +1,11 @@
-## Ignore all files/folders in data/
+## Ignore .cache
+.cache
+
+## Ignore data
 data/*
+
+## Ignore all .log files
+*.log
 
 ## Ignore all .pt files
 *.pt
-
-## Ignore .cache
-.cache

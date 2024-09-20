@@ -119,6 +119,20 @@ class Block(nn.Module):
         x = self.mask_1.to(x.device) * x + self.attn_scale * self.attn(rmsnorm(x))
         x = self.mask_2.to(x.device) * x + self.mlp(rmsnorm(x))
         return x
+    
+# class Block(nn.Module):
+
+#     def __init__(self, config):
+#         super().__init__()
+#         self.attn = CausalSelfAttention(config)
+#         self.mlp = MLP(config)
+#         self.attn_scale = 1 / math.sqrt(2 * config.n_layer)
+#         self.dropout = nn.Dropout(0.1)
+
+#     def forward(self, x):
+#         x = self.dropout(x) + self.attn_scale * self.attn(rmsnorm(x))
+#         x = self.dropout(x) + self.mlp(rmsnorm(x))
+#         return x
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -367,6 +381,8 @@ if __name__ == "__main__":
             pass
 
     timings = []
+    tokens_processed = 0  # Initialize the counter
+
     for step in range(args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations)
@@ -406,6 +422,10 @@ if __name__ == "__main__":
             train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
+        
+        # Update the tokens processed counter
+        tokens_processed += tokens_per_fwdbwd
+
         # backward pass
         loss.backward()
         # determine and set the learning rate for this iteration
@@ -425,7 +445,7 @@ if __name__ == "__main__":
         tokens_per_second = ddp_world_size * B * T / (t1-t0)
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item() # keep track of the mean loss
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
+        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s | total tokens: {tokens_processed:,})")
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
@@ -444,6 +464,9 @@ if __name__ == "__main__":
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # Print final total tokens processed
+    print0(f"Total tokens processed: {tokens_processed:,}")
 
     # -------------------------------------------------------------------------
 
