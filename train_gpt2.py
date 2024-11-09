@@ -1,31 +1,132 @@
 import os
 import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
 import uuid
-import math
 import glob
+import time
 from dataclasses import dataclass
 import random
 
 import numpy as np
 import torch
 from torch import nn
-import torch.distributed as dist
 import torch.nn.functional as F
+import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 
-with open(sys.argv[0]) as f:
-    code = f.read()
+# -----------------------------------------------------------------------------
+# Muon optimizer
+
+def zeropower_via_svd(G, steps=None):
+    U, S, V = G.svd()
+    return U @ V.T
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = A @ X
+        X = a * X + b * B + c * A @ B
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+
+        for group in self.param_groups:
+
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+
+            # generate weight updates in distributed fashion
+            total_params = sum(p.numel() for p in group['params'])
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
+            for i, p in enumerate(group['params']):
+                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    if group['nesterov']:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    g *= max(1, g.size(0)/g.size(1))**0.5
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                curr_idx += p.numel()
+
+            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            # deserialize and apply updates
+            curr_idx = 0
+            for p in group['params']:
+                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
 class Rotary(torch.nn.Module):
+
     def __init__(self, dim, base=10000):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -36,8 +137,8 @@ class Rotary(torch.nn.Module):
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.outer(t, self.inv_freq).to(x.device)
-            self.cos_cached = freqs.cos()
-            self.sin_cached = freqs.sin()
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 def apply_rotary_emb(x, cos, sin):
@@ -47,12 +148,11 @@ def apply_rotary_emb(x, cos, sin):
     x2 = x[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+    return torch.cat([y1, y2], 3).type_as(x)
 
-def rmsnorm(x0, eps=1e-6):
-    x = x0.float()
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    return x.type_as(x0)
+class CastedLinear(nn.Linear):
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype))
 
 class CausalSelfAttention(nn.Module):
 
@@ -62,39 +162,42 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
+        self.c_q = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = CastedLinear(self.n_embd, self.n_embd, bias=False)
         # output projection
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
+        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
 
-    def forward(self, x):
+    def forward(self, x, v1=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim)
-        q = q.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        if v1 is None:
+            v1 = v # This happens if we are in the first block. v needs to be accessed by subsequent blocks
+        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
         cos, sin = self.rotary(q)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
-        return y
+        return y, v1
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc    = CastedLinear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = CastedLinear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.gelu(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
 
@@ -104,22 +207,15 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
-        self.attn_scale = 1 / math.sqrt(2 * config.n_layer)
-        self.mask_1 = self._create_mask(config.mask_1, config.n_embd)
-        self.mask_2 = self._create_mask(config.mask_2, config.n_embd)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def _create_mask(self, mask_value, size):
-        if mask_value in (0.0, 1.0):
-            return torch.full((size,), mask_value)
-        mask = torch.zeros(size)
-        mask[:int(mask_value * size)] = 1
-        return mask[torch.randperm(size)]
+    def forward(self, x, v1, x0):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1)
+        x = x + x1
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        return x, v1
 
-    def forward(self, x):
-        x = self.mask_1.to(x.device) * x + self.attn_scale * self.attn(rmsnorm(x))
-        x = self.mask_2.to(x.device) * x + self.mlp(rmsnorm(x))
-        return x
-    
 # class Block(nn.Module):
 
 #     def __init__(self, config):
@@ -127,11 +223,19 @@ class Block(nn.Module):
 #         self.attn = CausalSelfAttention(config)
 #         self.mlp = MLP(config)
 #         self.attn_scale = 1 / math.sqrt(2 * config.n_layer)
-#         self.dropout = nn.Dropout(0.1)
+#         self.mask_1 = self._create_mask(config.mask_1, config.n_embd)
+#         self.mask_2 = self._create_mask(config.mask_2, config.n_embd)
+
+#     def _create_mask(self, mask_value, size):
+#         if mask_value in (0.0, 1.0):
+#             return torch.full((size,), mask_value)
+#         mask = torch.zeros(size)
+#         mask[:int(mask_value * size)] = 1
+#         return mask[torch.randperm(size)]
 
 #     def forward(self, x):
-#         x = self.dropout(x) + self.attn_scale * self.attn(rmsnorm(x))
-#         x = self.dropout(x) + self.mlp(rmsnorm(x))
+#         x = self.mask_1.to(x.device) * x + self.attn_scale * self.attn(rmsnorm(x))
+#         x = self.mask_2.to(x.device) * x + self.mlp(rmsnorm(x))
 #         return x
 
 # -----------------------------------------------------------------------------
@@ -139,10 +243,10 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
+    vocab_size : int = 50304
+    n_layer : int = 12
+    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 768
     mask_1: float = 1.0  # New parameter for the first mask
     mask_2: float = 1.0  # New parameter for the second mask
 
@@ -156,38 +260,25 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.weight.data.zero_() # @Grad62304977
 
-    def forward(self, idx, targets=None, return_logits=True):
-        b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=idx.device) # shape (t)
+    def forward(self, idx, target):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-
+        x = F.rms_norm(x, (x.size(-1),)) # @Grad62304977
+        x0 = x
+        v1 = None
         for block in self.transformer.h:
-            x = block(x)
-        x = rmsnorm(x)
+            x, v1 = block(x, v1, x0)
+        x = F.rms_norm(x, (x.size(-1),))
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
-
-        # there are performance reasons why not returning logits is prudent, if not needed
-        if not return_logits:
-            logits = None
-
-        return logits, loss
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas)
-        return optimizer
+        logits = self.lm_head(x)
+        logits = 30 * torch.tanh(logits / 30) # @Grad62304977
+        logits = logits.float()
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        return loss.float()
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -235,9 +326,8 @@ class DistributedDataLoader:
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
             assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += shard_ntok
+            ntok_total += int(shard_ntok)
         self.ntok_total = ntok_total
-        print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
 
         # kick things off
         self.reset()
@@ -268,158 +358,187 @@ class DistributedDataLoader:
 # -----------------------------------------------------------------------------
 # int main
 
-def print0(*args, **kwargs):
-    # modified print that only prints from the master process
-    # if this is not a distributed run, it's just a print
-    if int(os.environ.get("RANK", 0)) == 0:
-        print(*args, **kwargs)
+@dataclass
+class Hyperparameters:
+    # data hyperparams
+    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # optimization hyperparams
+    batch_size : int = 8*64 # batch size, in sequences, across all devices
+    device_batch_size : int = 64 # batch size, in sequences, per device
+    sequence_length : int = 1024 # sequence length, in tokens
+    num_iterations : int = 3242 # number of iterations to run
+    warmup_iters : int = 0
+    warmdown_iters : int = 926 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    weight_decay : float = 0
+    # evaluation and logging hyperparams
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    # Mask
+    mask_1: float = 1.0
+    mask_2: float = 1.0
 
-if __name__ == "__main__":
-    import time
-    import argparse
-    print0(f"Running pytorch {torch.version.__version__}")
+args = Hyperparameters()
 
-    parser = argparse.ArgumentParser()
-    # file system input / output
-    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
-    parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
-    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="d12", help="d12|d24|d36|d48")
-    # token layout for each step of the optimization
-    parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
-    parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
-    # workload (number of steps)
-    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
-    # optimization
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
-    parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
-    parser.add_argument("--warmdown_iters", type=int, default=0, help="learning rate warmdown iterations")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
-    # evaluation
-    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
-    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
-    parser.add_argument("--save_every", type=int, default=5000, help="every how many steps to save the checkpoint")
-    parser.add_argument("--mask_1", type=float, default=1.0, help="Mask value for the first residual connection")
-    parser.add_argument("--mask_2", type=float, default=1.0, help="Mask value for the second residual connection")
-    args = parser.parse_args()
+# set up DDP (distributed data parallel). torchrun sets this env variable
+assert torch.cuda.is_available()
+dist.init_process_group(backend='nccl')
+ddp_rank = int(os.environ['RANK'])
+ddp_local_rank = int(os.environ['LOCAL_RANK'])
+ddp_world_size = int(os.environ['WORLD_SIZE'])
+device = f'cuda:{ddp_local_rank}'
+torch.cuda.set_device(device)
+print(f"using device: {device}")
+master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-    # args error checking and convenience variables
-    B, T = args.batch_size, args.sequence_length
-    assert args.model in {"d12", "d24", "d36", "d48"}
+# convenience variables
+B, T = args.device_batch_size, args.sequence_length
+# calculate the number of steps to take in the val loop.
+assert args.val_tokens % (B * T * ddp_world_size) == 0
+val_steps = args.val_tokens // (B * T * ddp_world_size)
+# calculate the steps of gradient accumulation required to attain the desired global batch size.
+assert args.batch_size % (B * ddp_world_size) == 0
+train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
-    # set up DDP (distributed data parallel). torchrun sets this env variable
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    print(f"using device: {device}")
+# load tokens
+train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+if master_process:
+    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+x, y = train_loader.next_batch()
 
-    tokens_per_fwdbwd = B * T * ddp_world_size
+# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# this originates from Karpathy's experiments.
+num_vocab = 50304
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768, mask_1=mask_1, mask_2=mask_2))
+model = model.cuda().bfloat16()
+for m in model.modules():
+    if isinstance(m, CastedLinear):
+        m.float()
+if hasattr(config, "coordinate_descent_tuning"):
+    config.coordinate_descent_tuning = True # suggested by @Chillee
+model = torch.compile(model)
+# here we wrap model into DDP container
+model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module # always contains the "raw" unwrapped model
 
-    # set up a context manager following the desired dtype and device
-    ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+enable_cudnn_sdp(True)
+enable_flash_sdp(False)
+enable_mem_efficient_sdp(False)
+enable_math_sdp(False)
 
-    # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    val_loader = None
-    if args.input_val_bin:
-        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-    x, y = train_loader.next_batch()
+# init the optimizer(s)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
+params = list(raw_model.transformer.h.parameters())
+matrix_params = [p for p in params if p.ndim == 2]
+scalar_params = [p for p in params if p.ndim < 2]
+optimizer3 = Muon(matrix_params,           lr=0.02,  momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.02, betas=(0.9, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+# learning rate decay scheduler (linear warmup and warmdown)
+def get_lr(it):
+    assert it <= args.num_iterations
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_iters:
+        return (it+1) / args.warmup_iters
+    # 2) constant lr for a while
+    elif it < args.num_iterations - args.warmdown_iters:
+        return 1.0
+    # 3) linear warmdown
+    else:
+        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+        return decay_ratio
+schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-    # init the model from scratch
-    num_vocab = 50257
-    model_config = {
-        "d12": GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768, mask_1=args.mask_1, mask_2=args.mask_2),
-        "d24": GPTConfig(vocab_size=num_vocab, n_layer=24, n_head=16, n_embd=1024, mask_1=args.mask_1, mask_2=args.mask_2),
-        "d36": GPTConfig(vocab_size=num_vocab, n_layer=36, n_head=20, n_embd=1280, mask_1=args.mask_1, mask_2=args.mask_2),
-        "d48": GPTConfig(vocab_size=num_vocab, n_layer=48, n_head=25, n_embd=1600, mask_1=args.mask_1, mask_2=args.mask_2),
-    }[args.model]
-    model = GPT(model_config)
-    model = model.train().cuda()
-    if hasattr(config, "coordinate_descent_tuning"):
-        config.coordinate_descent_tuning = True # suggested by @Chillee
-    print0("compiling the model...")
-    model = torch.compile(model)
-
-    # here we wrap model into DDP container
-    model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module # always contains the "raw" unwrapped model
-
-    # init the optimizer
-    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device)
-
-    # learning rate decay scheduler (linear warmup and warmdown)
-    def get_lr(it):
-        assert it <= args.num_iterations
-        # 1) linear warmup for warmup_iters steps
-        if it < args.warmup_iters:
-            return args.learning_rate * (it+1) / args.warmup_iters
-        # 2) constant lr for a while
-        elif it < args.num_iterations - args.warmdown_iters:
-            return args.learning_rate
-        # 3) linear warmdown
-        else:
-            decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-            return args.learning_rate * decay_ratio
-
+# begin logging
+if master_process:
     run_id = str(uuid.uuid4())
+    logdir = 'logs/%s/' % run_id
+    os.makedirs(logdir, exist_ok=True)
+    logfile = 'logs/%s.txt' % run_id
+    # create the log file
+    with open(logfile, "w") as f:
+        # begin the log by printing this file (the Python code)
+        f.write('='*100 + '\n')
+        f.write(code)
+        f.write('='*100 + '\n')
+        # log information about the hardware/software environment this is running on
+        # and print the full `nvidia-smi` to file
+        f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
+        import subprocess
+        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        f.write(f'{result.stdout}\n')
+        f.write('='*100 + '\n')
 
-    # create the logging directory if it does not exist
-    logfile = None
-    if master_process and args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logfile = os.path.join(args.output_dir, "%s.log" % run_id)
-        # create the log file "main.log" inside it, and wipe it clean
-        with open(logfile, "w") as f:
-            pass
-
-    timings = []
-    tokens_processed = 0  # Initialize the counter
-
-    for step in range(args.num_iterations + 1):
+training_time_ms = 0
+# start the clock
+torch.cuda.synchronize()
+t0 = time.time()
+# begin training
+train_loader.reset()
+for step in range(args.num_iterations + 1):
+    last_step = (step == args.num_iterations)
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    if step == 10:
+        training_time_ms = 0
         t0 = time.time()
-        last_step = (step == args.num_iterations)
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-        # once in a while evaluate the validation dataset
-        if (args.val_loss_every > 0 \
-            and (step % args.val_loss_every == 0 or last_step)) \
-            and (val_loader is not None):
-            model.eval()
-            val_loader.reset()
+    # once in a while evaluate the validation dataset
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # run validation batches
+        model.eval()
+        val_loader.reset()
+        val_loss = 0.0
+        for _ in range(val_steps):
             with torch.no_grad():
-                val_loss = 0.0
-                for _ in range(args.val_max_steps):
-                    x_val, y_val = val_loader.next_batch()
-                    _, loss = model(x_val, y_val, return_logits=False)
-                    val_loss += loss
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-                val_loss /= args.val_max_steps
-            # log to console and to file
-            print0(f"val loss {val_loss}")
-            if master_process and logfile is not None:
-                with open(logfile, "a") as f:
-                    f.write("s:%d tel:%f\n" % (step, val_loss))
+                x_val, y_val = val_loader.next_batch()
+                val_loss += model(x_val, y_val)
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        val_loss /= val_steps
+        # log val loss to console and to logfile
+        if master_process:
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            with open(logfile, "a") as f:
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
 
-        # bit confusing: we want to make sure to eval on 0th iteration
-        # but also after the very last iteration. so we loop for step <= num_iterations
-        # instead of just < num_iterations (one extra due to <=), only to do
-        # the validation/sampling one last time, and then we break right here as we're done.
-        if last_step:
-            break
+    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # save the state of the training process
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
 
-        # --------------- TRAINING SECTION BEGIN -----------------
-        model.train()
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
+    if last_step:
+        break
+
+    # --------------- TRAINING SECTION BEGIN -----------------
+    model.train()
+    for i in range(1, train_accumulation_steps+1):
         # forward pass
-        with ctx:
-            _, loss = model(x, y, return_logits=False)
-            train_loss = loss.detach()
+        loss = model(x, y)
+        train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         
@@ -427,54 +546,35 @@ if __name__ == "__main__":
         tokens_processed += tokens_per_fwdbwd
 
         # backward pass
-        loss.backward()
-        # determine and set the learning rate for this iteration
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        # step the optimizer
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        # --------------- TRAINING SECTION END -------------------
-        # everything that follows now is just diagnostics, prints, logging, etc.
+        if i < train_accumulation_steps:
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
+                loss.backward()
+        else:
+            loss.backward() # just sync on the last step
+    for p in model.parameters():
+        p.grad /= train_accumulation_steps
+    # momentum warmup for Muon
+    frac = min(step/500, 1)
+    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
 
-        torch.cuda.synchronize()
-        # time and print
-        t1 = time.time()
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        tokens_per_second = ddp_world_size * B * T / (t1-t0)
-        dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
-        lossf = train_loss.item() # keep track of the mean loss
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s | total tokens: {tokens_processed:,})")
-        # log to logile
-        if master_process and logfile is not None:
-            with open(logfile, "a") as f:
-                f.write("s:%d trl:%f\n" % (step, lossf))
-
-        # keep track of smooth timings, last 20 iterations
-        if step > 0 and step > args.num_iterations - 20:
-            timings.append(t1-t0)
-
-        if master_process and (step + 1) % args.save_every == 0:
-            log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
-            os.makedirs('logs/%s' % run_id, exist_ok=True)
-            torch.save(log, 'logs/%s/model_step%06d.pt' % (run_id, step))
-
-    # print the average of the last 20 timings, to get something smooth-ish
-    timings = timings[-20:]
-    print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
-    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
-
-    # Print final total tokens processed
-    print0(f"Total tokens processed: {tokens_processed:,}")
-
-    # -------------------------------------------------------------------------
-
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
-        log = dict(model=raw_model.state_dict(), code=code, args=args.__dict__)
-        os.makedirs('logs/%s' % run_id, exist_ok=True)
-        torch.save(log, 'logs/%s/final.pt' % run_id)
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        with open(logfile, "a") as f:
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
-    # -------------------------------------------------------------------------
-    # clean up nice
-    destroy_process_group()
+if master_process:
+    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+# -------------------------------------------------------------------------
+# clean up nice
+dist.destroy_process_group()

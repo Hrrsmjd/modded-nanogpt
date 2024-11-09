@@ -1,3 +1,5 @@
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
 #!/bin/bash
 
 # Experiment 1: mask_1=1.0, mask_2=1.0
